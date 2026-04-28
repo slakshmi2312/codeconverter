@@ -1,0 +1,10 @@
+{
+  "name": "c_to_js_printf",
+  "source_lang": "c",
+  "target_lang": "javascript",
+  "source_code": "#include <stdio.h>\nint main(){ printf(\"%d\\n\", 7); return 0; }",
+  "expected_contains": [
+    "console.log",
+    "7"
+  ]
+}

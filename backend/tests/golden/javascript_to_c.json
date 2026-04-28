@@ -1,0 +1,10 @@
+{
+  "name": "js_to_c_loop",
+  "source_lang": "javascript",
+  "target_lang": "c",
+  "source_code": "for (let i = 0; i < 3; i++) { console.log(i); }",
+  "expected_contains": [
+    "for",
+    "printf"
+  ]
+}
