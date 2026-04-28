@@ -9,7 +9,7 @@ from typing import Dict, Optional, Tuple
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from google import generativeai as genai
+from openai import OpenAI
 from pydantic import BaseModel, Field
 from tree_sitter_languages import get_parser
 
@@ -82,7 +82,7 @@ EXTENSION_MAP = {
 }
 
 SUPPORTED_LANGUAGES = {"python", "java", "c", "javascript"}
-GEMINI_MODELS = ["gemini-1.5-flash-latest", "gemini-1.5-flash-8b-latest", "gemini-2.0-flash"]
+OPENAI_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1-nano"]
 MAX_MODEL_RETRIES = 2
 AI_TIMEOUT_SECONDS = 18
 PIPELINE_MAX_FIX_LOOPS = 3
@@ -104,7 +104,7 @@ class ConvertRequest(BaseModel):
 
 class ConvertResponse(BaseModel):
     converted_code: str
-    provider: str = "gemini-1.5-flash"
+    provider: str = "openai"
     mode: str = "hybrid"
     warning: Optional[str] = None
     source_output: Optional[str] = None
@@ -152,8 +152,8 @@ def preprocess(code: str) -> str:
 
 
 def get_model_candidates() -> list[str]:
-    configured = (os.getenv("GEMINI_MODEL") or "").strip()
-    candidates = [configured, *GEMINI_MODELS] if configured else GEMINI_MODELS
+    configured = (os.getenv("OPENAI_MODEL") or "").strip()
+    candidates = [configured, *OPENAI_MODELS] if configured else OPENAI_MODELS
     unique: list[str] = []
     seen = set()
     for model in candidates:
@@ -346,40 +346,46 @@ def build_prompt(code: str, source_lang: str, target_lang: str) -> str:
     )
 
 
-def call_gemini_with_fallback(prompt: str) -> str:
+def call_openai_with_fallback(prompt: str, client: OpenAI) -> str:
     last_error = None
     for model_name in get_model_candidates():
         for attempt in range(MAX_MODEL_RETRIES):
             try:
-                model = genai.GenerativeModel(model_name)
-                result = model.generate_content(prompt, generation_config={"temperature": 0})
-                text = result.text if hasattr(result, "text") else ""
+                result = client.chat.completions.create(
+                    model=model_name,
+                    temperature=0,
+                    messages=[
+                        {"role": "system", "content": "You are a strict code transpiler. Return only target code."},
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                text = (result.choices[0].message.content or "").strip() if result.choices else ""
                 if text and text.strip():
                     return text
             except Exception as exc:
                 last_error = exc
                 if attempt < MAX_MODEL_RETRIES - 1:
                     time.sleep(1.0 * (attempt + 1))
-    raise HTTPException(status_code=502, detail=f"Gemini request failed: {last_error}")
+    raise HTTPException(status_code=502, detail=f"OpenAI request failed: {last_error}")
 
 
-def call_gemini_with_timeout(prompt: str) -> str:
+def call_openai_with_timeout(prompt: str, client: OpenAI) -> str:
     with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(call_gemini_with_fallback, prompt)
+        future = executor.submit(call_openai_with_fallback, prompt, client)
         try:
             return future.result(timeout=AI_TIMEOUT_SECONDS)
         except FuturesTimeoutError as exc:
             raise HTTPException(status_code=504, detail=f"AI conversion timed out after {AI_TIMEOUT_SECONDS}s.") from exc
 
 
-def convert_with_ai(code: str, source_lang: str, target_lang: str) -> str:
+def convert_with_ai(code: str, source_lang: str, target_lang: str, client: OpenAI) -> str:
     prompt = build_prompt(code, source_lang, target_lang)
-    raw = call_gemini_with_timeout(prompt)
+    raw = call_openai_with_timeout(prompt, client)
     cleaned = clean_ai_output(raw, target_lang)
     return sanitize_target_output(cleaned, target_lang)
 
 
-def convert_pipeline(code: str, source_lang: str, target_lang: str) -> ConvertResponse:
+def convert_pipeline(code: str, source_lang: str, target_lang: str, client: OpenAI) -> ConvertResponse:
     preprocessed = preprocess(code)
     source_output = run_code(source_lang, preprocessed)
 
@@ -391,7 +397,7 @@ def convert_pipeline(code: str, source_lang: str, target_lang: str) -> ConvertRe
     loops = 0
 
     for loops in range(1, PIPELINE_MAX_FIX_LOOPS + 1):
-        converted = convert_with_ai(prompt_input, source_lang, target_lang)
+        converted = convert_with_ai(prompt_input, source_lang, target_lang, client)
         last_converted = converted
 
         if not converted.strip():
@@ -478,12 +484,12 @@ def convert(payload: ConvertRequest) -> ConvertResponse:
 
     validate_with_tree_sitter(payload.code, source_lang, stage="source")
 
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not found in backend/.env")
-    genai.configure(api_key=api_key)
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not found in backend/.env")
+    client = OpenAI(api_key=api_key)
 
-    return convert_pipeline(payload.code, source_lang, target_lang)
+    return convert_pipeline(payload.code, source_lang, target_lang, client)
 
 
 @app.post("/compile", response_model=CompileResponse)

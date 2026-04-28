@@ -2,7 +2,7 @@
 
 This project contains:
 
-- `backend/` - FastAPI + Gemini 1.5 Flash
+- `backend/` - FastAPI + OpenAI
 - `frontend/` - React + Vite + Tailwind + Monaco Editor
 
 The backend runs on port `8000` and exposes `POST /convert`.
@@ -19,7 +19,8 @@ pip install -r requirements.txt
 Set key in `backend/.env`:
 
 ```env
-GEMINI_API_KEY=your_gemini_api_key_here
+OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_MODEL=gpt-4o-mini
 ```
 
 Run backend:
@@ -57,7 +58,7 @@ Response:
 ```json
 {
   "converted_code": "...",
-  "provider": "gemini-1.5-flash",
+  "provider": "openai",
   "mode": "hybrid"
 }
 ```
@@ -65,5 +66,5 @@ Response:
 ## Quality upgrades included
 
 - AST validation pre/post conversion via `tree-sitter` + `tree-sitter-languages`
-- Retry/fallback model strategy across multiple Gemini models with per-model retries
+- Retry/fallback model strategy across multiple OpenAI models with per-model retries
 - Golden test suite in `backend/tests/golden` + pytest checks in `backend/tests/test_transpiler_quality.py`
