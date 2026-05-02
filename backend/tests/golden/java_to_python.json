@@ -1,0 +1,10 @@
+{
+  "name": "java_to_python_print",
+  "source_lang": "java",
+  "target_lang": "python",
+  "source_code": "public class Main { public static void main(String[] args) { System.out.println(42); } }",
+  "expected_contains": [
+    "print",
+    "42"
+  ]
+}
