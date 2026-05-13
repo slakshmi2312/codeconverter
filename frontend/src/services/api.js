@@ -37,3 +37,12 @@ export async function runCode(payload) {
     throw new Error(getApiErrorMessage(error, "Run failed."));
   }
 }
+
+export async function detectLanguage(payload) {
+  try {
+    const response = await api.post("/detect-language", payload);
+    return response.data;
+  } catch (error) {
+    throw new Error(getApiErrorMessage(error, "Language detection failed."));
+  }
+}

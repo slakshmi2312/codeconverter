@@ -1,0 +1,10 @@
+{
+  "name": "java_to_python_concat_hint",
+  "source_lang": "java",
+  "target_lang": "python",
+  "source_code": "public class Main { public static void main(String[] args) { int x = 1; System.out.println(\"x=\" + x); } }",
+  "expected_contains": [
+    "print",
+    "x"
+  ]
+}

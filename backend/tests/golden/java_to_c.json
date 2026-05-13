@@ -1,0 +1,11 @@
+{
+  "name": "java_to_c_hello",
+  "source_lang": "java",
+  "target_lang": "c",
+  "source_code": "public class Main { public static void main(String[] args) { System.out.println(42); } }",
+  "expected_contains": [
+    "printf",
+    "42",
+    "main"
+  ]
+}

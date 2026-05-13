@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import CodeEditorPanel from "./components/CodeEditorPanel";
-import { convertCode, runCode } from "./services/api";
+import { convertCode, detectLanguage, runCode } from "./services/api";
 
 const languages = [
   { value: "python", label: "Python" },
@@ -56,6 +56,7 @@ function App() {
   const [targetOutput, setTargetOutput] = useState("");
   const [copiedSource, setCopiedSource] = useState(false);
   const [copiedTarget, setCopiedTarget] = useState(false);
+  const detectDebounceRef = useRef(null);
   const isDark = theme === "dark";
 
   const canConvert = useMemo(
@@ -143,7 +144,43 @@ function App() {
     setInputCode(merged);
     setSourceLang(dominantLang);
     setError("");
+
+    // ML-based backend detection after upload; keeps UI language selector in sync.
+    try {
+      const detected = await detectLanguage({ code: merged });
+      if (detected?.language) {
+        setSourceLang(detected.language);
+      }
+    } catch {
+      // Keep existing heuristic result if backend detection fails.
+    }
   };
+
+  useEffect(() => {
+    const text = inputCode.trim();
+    if (!text) return;
+
+    if (detectDebounceRef.current) {
+      clearTimeout(detectDebounceRef.current);
+    }
+
+    detectDebounceRef.current = setTimeout(async () => {
+      try {
+        const detected = await detectLanguage({ code: text });
+        if (detected?.language) {
+          setSourceLang((prev) => (prev === detected.language ? prev : detected.language));
+        }
+      } catch {
+        // Avoid interrupting editor usage on transient detect errors.
+      }
+    }, 550);
+
+    return () => {
+      if (detectDebounceRef.current) {
+        clearTimeout(detectDebounceRef.current);
+      }
+    };
+  }, [inputCode]);
 
   const handleRunSource = async () => {
     if (!inputCode.trim()) {

@@ -1,16 +1,25 @@
+import logging
 import os
 import re
 import time
 from typing import Dict, Optional, Tuple
+
+import requests
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel, Field
-import requests
+from ast_parser import ast_feature_dict
+from inference import CodeT5InferenceEngine
+from language_detector import MLLanguageDetector
+from output_validator import collect_post_conversion_warnings, format_validation_warnings
+from semantic_validator import semantic_similarity_score
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # Aash Gates Rescue Build
@@ -33,7 +42,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 AI_TIMEOUT_SECONDS = 20
 
 LANG_HINTS: Dict[Tuple[str, str], str] = {
-    ("java", "python"): "Convert Java types, braces, main method, and System.out.println into clean Python.",
+    ("java", "python"): "Convert Java types, braces, main method, and System.out.println into clean Python. Use print with commas for mixed types (e.g. print(\"x:\", n)), not string + int concatenation. For loops like for (int i=1; i<=N; i++) use range(1, N+1) in Python.",
     ("python", "java"): "Wrap code inside public class Main and public static void main where needed.",
     ("c", "python"): "Convert printf/scanf, loops, arrays, and main function into simple Python.",
     ("python", "c"): "Create a complete C program with #include <stdio.h> and int main where needed.",
@@ -41,8 +50,9 @@ LANG_HINTS: Dict[Tuple[str, str], str] = {
     ("python", "javascript"): "Convert print, indentation blocks, and Python lists into JavaScript syntax.",
     ("java", "javascript"): "Convert Java classes and System.out.println into JavaScript classes or simple functions.",
     ("javascript", "java"): "Convert console.log and JS syntax into Java with class Main where needed.",
+    ("c", "javascript"): "Map C int locals to let/const in JavaScript before using them. Preserve every simple `int name = value;` as `let name = value;`. Use console.log with commas for mixed types. Use for (let i = ...) loops; arrays as const a = [...].",
     ("c", "java"): "Convert C main, printf, primitive variables, and loops into Java class Main.",
-    ("java", "c"): "Convert Java main, System.out.println, primitive variables, and loops into C main.",
+    ("java", "c"): "Convert Java main, System.out.println, primitive variables, and loops into C main. C has NO range-for over arrays: use int arr[] = {...}; for (int i = 0; i < n; i++) { int x = arr[i]; ... }. Use printf with \\n for line-oriented output.",
 }
 
 MASTER_PROMPT = """You are a strict code transpiler.
@@ -74,6 +84,10 @@ class ConvertResponse(BaseModel):
     mode: str = "hybrid-rule-ai"
     warning: Optional[str] = None
     iterations: int = 1
+    semantic_score: int = 0
+    execution_output: str = ""
+    execution_error: Optional[str] = None
+    status: str = "success"
 
 
 class CompileRequest(BaseModel):
@@ -94,6 +108,16 @@ class RunRequest(BaseModel):
 class RunResponse(BaseModel):
     output: str
     error: Optional[str] = None
+
+
+class DetectLanguageRequest(BaseModel):
+    code: str = Field(min_length=1)
+
+
+class DetectLanguageResponse(BaseModel):
+    language: str
+    confidence: float
+    method: str = "ml"
 
 
 JUDGE0_LANGUAGE_IDS = {
@@ -207,7 +231,265 @@ def rule_based_preconvert(code: str, source_lang: str, target_lang: str) -> str:
     return text.strip()
 
 
-def sanitize_target_output(code: str, target_lang: str) -> str:
+def _split_plus_outside_strings(text: str) -> list[str]:
+    """Split on '+' only outside quoted regions (handles \" and \\ inside double-quoted strings)."""
+    text = text.strip()
+    parts: list[str] = []
+    buf: list[str] = []
+    i = 0
+    in_quote: Optional[str] = None
+    while i < len(text):
+        ch = text[i]
+        if in_quote is not None:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < len(text):
+                buf.append(text[i + 1])
+                i += 2
+                continue
+            if ch == in_quote:
+                in_quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            in_quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "+":
+            piece = "".join(buf).strip()
+            if piece:
+                parts.append(piece)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _is_simple_string_literal(s: str) -> bool:
+    s = s.strip()
+    return len(s) >= 2 and s[0] in "\"'" and s[-1] == s[0]
+
+
+def _try_rewrite_print_concat_to_comma_args(inner: str) -> Optional[str]:
+    """
+    Turn print("a" + b + "c" + d) into print("a", b, "c", d) so ints do not need str() (Java-style concat fix).
+    Returns None if the expression is not a simple chain of literals + identifiers.
+    """
+    parts = _split_plus_outside_strings(inner)
+    if len(parts) < 2:
+        return None
+    for p in parts:
+        ps = p.strip()
+        if not (_is_simple_string_literal(ps) or re.fullmatch(r"[A-Za-z_]\w*", ps)):
+            return None
+    return ", ".join(p.strip() for p in parts)
+
+
+def _extract_print_call_args(line: str) -> Optional[Tuple[int, int, str]]:
+    """If line is a single print(...), return (start_idx of '(', end_idx after ')', inner_args)."""
+    m = re.search(r"\bprint\s*\(", line)
+    if not m:
+        return None
+    open_paren = m.end() - 1
+    depth = 0
+    i = open_paren
+    while i < len(line):
+        if line[i] == "(":
+            depth += 1
+        elif line[i] == ")":
+            depth -= 1
+            if depth == 0:
+                inner = line[open_paren + 1 : i]
+                return open_paren, i + 1, inner
+        i += 1
+    return None
+
+
+def fix_python_java_style_print_concat(code: str) -> str:
+    """Fix TypeError from print(\"...\" + int_var) patterns common in Java→Python conversions."""
+    new_lines: list[str] = []
+    for line in code.splitlines():
+        if "print(" not in line or "+" not in line:
+            new_lines.append(line)
+            continue
+        parsed = _extract_print_call_args(line)
+        if not parsed:
+            new_lines.append(line)
+            continue
+        open_paren, end_after_close, inner = parsed
+        if "+" not in inner:
+            new_lines.append(line)
+            continue
+        rewritten = _try_rewrite_print_concat_to_comma_args(inner)
+        if not rewritten:
+            new_lines.append(line)
+            continue
+        m = re.search(r"\bprint\s*\(", line)
+        if not m:
+            new_lines.append(line)
+            continue
+        prefix = line[: m.end()]
+        suffix = line[end_after_close:]
+        new_lines.append(prefix + rewritten + ")" + suffix)
+    return "\n".join(new_lines)
+
+
+def _consume_next_c_statement(s: str, start: int) -> Tuple[str, int]:
+    """From start, skip whitespace then read one C statement (brace block or until `;` at depth 0)."""
+    n = len(s)
+    i = start
+    while i < n and s[i] in " \t\n\r":
+        i += 1
+    if i >= n:
+        return "", i
+
+    if s[i] == "{":
+        depth = 1
+        buf = [s[i]]
+        i += 1
+        while i < n and depth > 0:
+            if s[i] == "{":
+                depth += 1
+            elif s[i] == "}":
+                depth -= 1
+            buf.append(s[i])
+            i += 1
+        return "".join(buf), i
+
+    paren = 0
+    in_quote: Optional[str] = None
+    escape = False
+    buf: list[str] = []
+    while i < n:
+        ch = s[i]
+        if escape:
+            buf.append(ch)
+            escape = False
+            i += 1
+            continue
+        if in_quote:
+            buf.append(ch)
+            if ch == "\\":
+                escape = True
+            elif ch == in_quote:
+                in_quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            in_quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            paren += 1
+        elif ch == ")":
+            paren -= 1
+        buf.append(ch)
+        i += 1
+        if ch == ";" and paren == 0:
+            break
+    return "".join(buf), i
+
+
+def fix_c_java_foreach_initializer_list(code: str) -> str:
+    """
+    Rewrite invalid Java-style `for (int x : { a, b, c })` (not valid C) into a classic indexed for-loop
+    and attach the next statement as the loop body.
+    """
+    pattern = re.compile(
+        r"for\s*\(\s*int\s+(\w+)\s*:\s*\{\s*([^}]*?)\s*\}\s*\)",
+        re.MULTILINE | re.DOTALL,
+    )
+    uid = 0
+    pos = 0
+    parts: list[str] = []
+    for m in pattern.finditer(code):
+        parts.append(code[pos : m.start()])
+        pos = m.end()
+        var = m.group(1)
+        raw = m.group(2)
+        vals = [v.strip() for v in raw.replace("\n", " ").split(",") if v.strip()]
+        if not vals:
+            parts.append(m.group(0))
+            continue
+        inner_vals = ", ".join(vals)
+        uid += 1
+        stmt, stmt_end = _consume_next_c_statement(code, pos)
+        pos = stmt_end
+        stmt_clean = stmt.strip()
+        if not stmt_clean:
+            stmt_block = ""
+        else:
+            indented = "\n".join("        " + ln if ln.strip() else "" for ln in stmt_clean.splitlines())
+            stmt_block = f"\n{indented}\n"
+        block = (
+            f"    int __cc_arr_{uid}[] = {{{inner_vals}}};\n"
+            f"    int __cc_n_{uid} = (int)(sizeof(__cc_arr_{uid}) / sizeof(__cc_arr_{uid}[0]));\n"
+            f"    for (int __cc_k_{uid} = 0; __cc_k_{uid} < __cc_n_{uid}; __cc_k_{uid}++) {{\n"
+            f"        int {var} = __cc_arr_{uid}[__cc_k_{uid}];"
+            f"{stmt_block}"
+            f"    }}"
+        )
+        parts.append(block)
+    parts.append(code[pos:])
+    return "".join(parts)
+
+
+def strip_c_conversion_hallucinations(code: str) -> str:
+    """Remove common model artifacts that are not in the source program."""
+    drop_patterns = (
+        r"java\s+test\s+completed",
+        r"conversion\s+completed\s+successfully",
+        r"test\s+completed\s+successfully",
+    )
+    lines_out: list[str] = []
+    for line in code.splitlines():
+        low = line.lower()
+        if any(re.search(p, low) for p in drop_patterns):
+            continue
+        lines_out.append(line)
+    return "\n".join(lines_out)
+
+
+def fix_javascript_inject_simple_int_decls(js_code: str, source_code: str) -> str:
+    """
+    C/Java→JS models often drop top-level `int a = 10;` locals and emit `console.log(a)` first → ReferenceError.
+    Prepend `let` lines for simple `int name = rhs;` from the source (skips arrays/sizeof).
+    """
+    decls: list[Tuple[str, str]] = []
+    for m in re.finditer(r"^\s*int\s+(\w+)\s*=\s*([^;]+);\s*$", source_code, re.MULTILINE):
+        name, rhs = m.group(1), m.group(2).strip()
+        if "[" in rhs or "]" in rhs or "sizeof" in rhs.lower():
+            continue
+        decls.append((name, rhs))
+
+    if not decls:
+        return js_code
+
+    prelude: list[str] = []
+    for name, rhs in decls:
+        if re.search(rf"\b(let|const|var)\s+{re.escape(name)}\s*=", js_code):
+            continue
+        prelude.append(f"let {name} = {rhs.strip()};")
+
+    if not prelude:
+        return js_code
+
+    return "\n".join(prelude) + "\n" + js_code.strip()
+
+
+def sanitize_target_output(
+    code: str,
+    target_lang: str,
+    *,
+    source_lang: Optional[str] = None,
+    source_code: Optional[str] = None,
+) -> str:
     out = code.strip()
 
     if target_lang == "python":
@@ -215,10 +497,13 @@ def sanitize_target_output(code: str, target_lang: str) -> str:
         out = out.replace("console.log", "print")
         out = re.sub(r"\b(int|float|double|long|String|boolean|char)\s+(\w+)\s*=", r"\2 =", out)
         out = re.sub(r";+\s*$", "", out, flags=re.MULTILINE)
+        out = fix_python_java_style_print_concat(out)
 
     elif target_lang == "javascript":
         out = out.replace("System.out.println", "console.log")
         out = re.sub(r"^print\((.*)\)$", r"console.log(\1);", out, flags=re.MULTILINE)
+        if source_lang in ("c", "java") and source_code:
+            out = fix_javascript_inject_simple_int_decls(out, source_code)
 
     elif target_lang == "java":
         out = out.replace("console.log", "System.out.println")
@@ -235,6 +520,8 @@ def sanitize_target_output(code: str, target_lang: str) -> str:
     elif target_lang == "c":
         out = out.replace("System.out.println", "printf")
         out = out.replace("console.log", "printf")
+        out = strip_c_conversion_hallucinations(out)
+        out = fix_c_java_foreach_initializer_list(out)
         if "#include <stdio.h>" not in out:
             out = "#include <stdio.h>\n\n" + out
         if "int main" not in out:
@@ -387,6 +674,24 @@ def call_openrouter(prompt: str, client: OpenAI, model: str) -> str:
         raise HTTPException(status_code=502, detail=f"OpenRouter request failed: {exc}") from exc
 
 
+CODET5_ENGINE = None
+LANGUAGE_DETECTOR = None
+
+
+def get_codet5_engine() -> CodeT5InferenceEngine:
+    global CODET5_ENGINE
+    if CODET5_ENGINE is None:
+        CODET5_ENGINE = CodeT5InferenceEngine()
+    return CODET5_ENGINE
+
+
+def get_language_detector() -> MLLanguageDetector:
+    global LANGUAGE_DETECTOR
+    if LANGUAGE_DETECTOR is None:
+        LANGUAGE_DETECTOR = MLLanguageDetector()
+    return LANGUAGE_DETECTOR
+
+
 def convert_pipeline(code: str, source_lang: str, target_lang: str) -> ConvertResponse:
     cleaned_input = preprocess(code)
     if not cleaned_input:
@@ -401,35 +706,105 @@ def convert_pipeline(code: str, source_lang: str, target_lang: str) -> ConvertRe
             model="soft-block",
             warning=f"Input already appears to be {target_lang}. Skipped reconversion.",
             iterations=0,
+            semantic_score=100,
+            execution_output="Skipped execution (input already in target language).",
+            execution_error=None,
+            status="success",
         )
 
     rule_input = rule_based_preconvert(cleaned_input, source_lang, target_lang)
     if not rule_input:
         rule_input = cleaned_input
 
-    model = get_openrouter_model()
-    client = get_openrouter_client()
-
-    prompt = build_prompt(rule_input, source_lang, target_lang)
-    raw_output = call_openrouter(prompt, client, model)
-    converted = clean_ai_output(raw_output, target_lang)
-    converted = sanitize_target_output(converted, target_lang)
-
     warning = None
+    model = "codet5"
+    mode = "ast-codet5-judge0"
+
+    # Semantic-aware pre-parse before translation.
+    _ = ast_feature_dict(rule_input, source_lang)
+
+    try:
+        codet5_engine = get_codet5_engine()
+        codet5_out = codet5_engine.translate(rule_input, source_lang, target_lang)
+        converted = codet5_out.converted_code
+        model = codet5_out.used_model or "codet5"
+    except Exception:
+        # Keep OpenRouter fallback for resiliency if local/inference path fails.
+        model = get_openrouter_model()
+        client = get_openrouter_client()
+        prompt = build_prompt(rule_input, source_lang, target_lang)
+        raw_output = call_openrouter(prompt, client, model)
+        converted = clean_ai_output(raw_output, target_lang)
+        mode = "ast-openrouter-fallback-judge0"
+        warning = "CodeT5 inference failed. Used OpenRouter fallback."
+
+    converted = sanitize_target_output(
+        converted,
+        target_lang,
+        source_lang=source_lang,
+        source_code=cleaned_input,
+    )
+    if not converted:
+        raise HTTPException(status_code=502, detail="Conversion produced empty output.")
+
+    val_warnings = collect_post_conversion_warnings(converted, target_lang)
+    if val_warnings:
+        val_msg = format_validation_warnings(val_warnings)
+        warning = f"{warning}; {val_msg}" if warning else val_msg
+    strict = (os.getenv("CONVERT_STRICT_VALIDATE") or "").strip().lower() in ("1", "true", "yes")
+    if strict and val_warnings:
+        critical = [w for w in val_warnings if any(x in w.lower() for x in ("syntax", "invalid", "empty"))]
+        if critical:
+            raise HTTPException(status_code=502, detail=format_validation_warnings(critical))
+
+    sem = semantic_similarity_score(cleaned_input, source_lang, converted, target_lang)
+
+    try:
+        run_res = run_code(converted, target_lang)
+        execution_output = run_res.output
+        execution_error = run_res.error
+    except HTTPException as exc:
+        execution_output = f"Execution validation unavailable: {exc.detail}"
+        execution_error = str(exc.detail)
+
     if model == "openrouter/free":
-        warning = "Using openrouter/free. Output quality can vary because OpenRouter may route to different free models."
+        warning = (
+            "Using openrouter/free. Output quality can vary because OpenRouter may route to different free models."
+            if not warning
+            else warning
+        )
+
+    response_status = "success" if not execution_error else "warning"
+    if val_warnings and response_status == "success":
+        blob = " ".join(val_warnings).lower()
+        if any(k in blob for k in ("syntax", "invalid", "unbalanced", "empty")):
+            response_status = "warning"
 
     return ConvertResponse(
         converted_code=converted,
+        provider="codet5" if "codet5" in model.lower() else "openrouter",
         model=model,
+        mode=mode,
         warning=warning,
         iterations=1,
+        semantic_score=sem["semantic_score"],
+        execution_output=execution_output,
+        execution_error=execution_error,
+        status=response_status,
     )
 
 
 # ============================================================
 # Remote code execution via Judge0 (no local compilers).
 # ============================================================
+
+JUDGE0_TIMEOUT_USER_MESSAGE = (
+    "Code execution service is taking too long. Please try again."
+)
+JUDGE0_UNREACHABLE_USER_MESSAGE = (
+    "Unable to reach the code execution service. Please try again later."
+)
+
 
 def _judge0_headers() -> Dict[str, str]:
     headers = {"Content-Type": "application/json"}
@@ -444,35 +819,149 @@ def _judge0_headers() -> Dict[str, str]:
     return headers
 
 
+def _judge0_http_request(method: str, url: str, **request_kwargs) -> Tuple[Optional[requests.Response], Optional[str]]:
+    """
+    Call Judge0 with retries. Returns (response, None) on success, or (None, user_message) after failures.
+
+    Retries up to 3 times with 2 seconds between attempts on timeout or connection errors.
+    Uses a 60-second HTTP read/connect timeout per attempt by default.
+    """
+    http_timeout = float(os.getenv("JUDGE0_HTTP_TIMEOUT_SECONDS", "60"))
+    max_retries = int(os.getenv("JUDGE0_MAX_RETRIES", "3"))
+    retry_delay = float(os.getenv("JUDGE0_RETRY_DELAY_SECONDS", "2"))
+
+    if "headers" not in request_kwargs:
+        request_kwargs["headers"] = _judge0_headers()
+    request_kwargs["timeout"] = http_timeout
+
+    last_error: Optional[BaseException] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            if method.upper() == "GET":
+                response = requests.get(url, **request_kwargs)
+            else:
+                response = requests.post(url, **request_kwargs)
+            return response, None
+        except requests.Timeout as exc:
+            last_error = exc
+            logger.warning(
+                "Judge0 %s timeout (attempt %s/%s) url=%s timeout=%ss detail=%r",
+                method.upper(),
+                attempt,
+                max_retries,
+                url,
+                http_timeout,
+                exc,
+                exc_info=True,
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            logger.error(
+                "Judge0 %s request error (attempt %s/%s) url=%s detail=%r",
+                method.upper(),
+                attempt,
+                max_retries,
+                url,
+                exc,
+                exc_info=True,
+            )
+
+        if attempt < max_retries:
+            time.sleep(retry_delay)
+
+    if isinstance(last_error, requests.Timeout):
+        logger.error(
+            "Judge0 gave up after %s attempts (timeout). url=%s last_error=%r",
+            max_retries,
+            url,
+            last_error,
+            exc_info=True,
+        )
+        return None, JUDGE0_TIMEOUT_USER_MESSAGE
+
+    logger.error(
+        "Judge0 gave up after %s attempts (not a timeout). url=%s last_error=%r",
+        max_retries,
+        url,
+        last_error,
+        exc_info=True,
+    )
+    return None, JUDGE0_UNREACHABLE_USER_MESSAGE
+
+
 def run_code(code: str, language: str) -> RunResponse:
+    """
+    Submit code to Judge0 and poll for results.
+    Does not raise for Judge0 network failures; returns RunResponse with a user-facing message instead.
+    """
     judge0_base = (os.getenv("JUDGE0_BASE_URL") or "https://ce.judge0.com").strip().rstrip("/")
     language_id = JUDGE0_LANGUAGE_IDS.get(language)
     if not language_id:
         raise HTTPException(status_code=400, detail=f"Execution unsupported for language '{language}'.")
 
     submit_url = f"{judge0_base}/submissions?base64_encoded=false&wait=false"
-    poll_timeout = float(os.getenv("JUDGE0_POLL_TIMEOUT_SECONDS", "12"))
+    poll_timeout = float(os.getenv("JUDGE0_POLL_TIMEOUT_SECONDS", "120"))
     poll_interval = float(os.getenv("JUDGE0_POLL_INTERVAL_SECONDS", "1"))
     timeout_at = time.time() + poll_timeout
 
     try:
-        submit_res = requests.post(
+        submit_res, err_msg = _judge0_http_request(
+            "POST",
             submit_url,
             json={"source_code": code, "language_id": language_id},
-            headers=_judge0_headers(),
-            timeout=15,
         )
-        submit_res.raise_for_status()
+        if err_msg:
+            return RunResponse(output=err_msg, error=err_msg)
+
+        try:
+            submit_res.raise_for_status()
+        except requests.HTTPError as exc:
+            logger.error(
+                "Judge0 submit HTTP error status=%s body=%s",
+                submit_res.status_code,
+                submit_res.text[:500] if submit_res.text else "",
+                exc_info=True,
+            )
+            friendly = "Code execution service returned an error. Please try again."
+            return RunResponse(output=friendly, error=str(exc))
+
         token = submit_res.json().get("token")
         if not token:
-            raise HTTPException(status_code=502, detail="Judge0 did not return a submission token.")
+            logger.error("Judge0 submit response missing token: %s", submit_res.text[:500])
+            return RunResponse(
+                output="Code execution service did not accept the submission. Please try again.",
+                error="Missing submission token",
+            )
 
         result_url = f"{judge0_base}/submissions/{token}?base64_encoded=false&fields=stdout,stderr,compile_output,status"
 
         while time.time() < timeout_at:
-            result_res = requests.get(result_url, headers=_judge0_headers(), timeout=15)
-            result_res.raise_for_status()
-            result = result_res.json()
+            result_res, poll_err = _judge0_http_request("GET", result_url)
+            if poll_err:
+                return RunResponse(output=poll_err, error=poll_err)
+
+            try:
+                result_res.raise_for_status()
+            except requests.HTTPError as exc:
+                logger.error(
+                    "Judge0 poll HTTP error status=%s body=%s",
+                    result_res.status_code,
+                    result_res.text[:500] if result_res.text else "",
+                    exc_info=True,
+                )
+                friendly = "Code execution service returned an error while fetching results. Please try again."
+                return RunResponse(output=friendly, error=str(exc))
+
+            try:
+                result = result_res.json()
+            except ValueError as exc:
+                logger.error("Judge0 poll invalid JSON: %s", result_res.text[:500], exc_info=True)
+                return RunResponse(
+                    output="Code execution service returned an invalid response. Please try again.",
+                    error=str(exc),
+                )
+
             status_id = (result.get("status") or {}).get("id", 0)
 
             if status_id not in {1, 2}:  # In Queue, Processing
@@ -490,11 +979,23 @@ def run_code(code: str, language: str) -> RunResponse:
 
             time.sleep(poll_interval)
 
-        return RunResponse(output="Execution timed out while waiting for Judge0 result.", error="Execution timeout")
+        logger.warning(
+            "Judge0 poll window exceeded (%.0fs) without terminal status for token=%s",
+            poll_timeout,
+            token,
+        )
+        return RunResponse(
+            output=JUDGE0_TIMEOUT_USER_MESSAGE,
+            error=JUDGE0_TIMEOUT_USER_MESSAGE,
+        )
     except HTTPException:
         raise
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Judge0 request failed: {exc}") from exc
+    except Exception as exc:
+        logger.exception("Unexpected error in run_code: %s", exc)
+        return RunResponse(
+            output="An unexpected error occurred while contacting the code execution service.",
+            error=str(exc),
+        )
 
 
 app = FastAPI(title="Multi-Language Code Converter API - OpenRouter Build")
@@ -537,3 +1038,21 @@ def compile_endpoint(payload: CompileRequest) -> CompileResponse:
 def run_endpoint(payload: RunRequest) -> RunResponse:
     language = normalize_language(payload.language)
     return run_code(payload.code, language)
+
+
+@app.post("/detect-language", response_model=DetectLanguageResponse)
+def detect_language_endpoint(payload: DetectLanguageRequest) -> DetectLanguageResponse:
+    code = preprocess(payload.code)
+    heuristic = detect_language_from_code(code)
+    detector = get_language_detector()
+    ml = detector.predict(code)
+    ml_lang = ml.get("language", "unknown")
+    confidence = float(ml.get("confidence", 0.0))
+
+    if confidence < 0.55 and heuristic in SUPPORTED_LANGUAGES:
+        return DetectLanguageResponse(language=heuristic, confidence=max(confidence, 0.55), method="hybrid")
+
+    if ml_lang not in SUPPORTED_LANGUAGES and heuristic in SUPPORTED_LANGUAGES:
+        return DetectLanguageResponse(language=heuristic, confidence=max(confidence, 0.51), method="hybrid")
+
+    return DetectLanguageResponse(language=ml_lang, confidence=confidence, method="ml")
