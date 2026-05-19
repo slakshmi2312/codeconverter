@@ -1,0 +1,10 @@
+{
+  "name": "python_to_java_loop",
+  "source_lang": "python",
+  "target_lang": "java",
+  "source_code": "for i in range(3):\n    print(i)\n",
+  "expected_contains": [
+    "for",
+    "System.out.println"
+  ]
+}
